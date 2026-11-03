@@ -1,0 +1,30 @@
+{
+  "name": "Argo CD GitOps POC",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+      "version": "latest",
+      "helm": "none",
+      "minikube": "none"
+    }
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb"
+  },
+  "forwardPorts": [8080, 8081],
+  "portsAttributes": {
+    "8080": { "label": "Argo CD UI", "onAutoForward": "notify" },
+    "8081": { "label": "Demo app (nginx)", "onAutoForward": "notify" }
+  },
+  "postCreateCommand": "bash scripts/install-tools.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        "redhat.vscode-yaml"
+      ]
+    }
+  }
+}
