@@ -1,0 +1,20 @@
+name: web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/web/**"
+      - ".github/workflows/web.yaml"
+      - ".github/workflows/build-and-deploy.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-deploy:
+    uses: ./.github/workflows/build-and-deploy.yaml
+    with:
+      component: web

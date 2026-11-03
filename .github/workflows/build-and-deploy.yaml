@@ -1,36 +1,37 @@
-# CI half of the GitOps loop:
-#   1. build the image from src/ and push it to GHCR, tagged with the commit SHA;
-#   2. write the new tag into app/deployment.yaml and commit it to main.
+# Reusable workflow: the CI half of the GitOps loop for one component.
+#   1. build src/<component> and push it to GHCR, tagged with the commit SHA;
+#   2. write the new tag into app/<component>.yaml and commit it to main.
 # Argo CD sees that commit and deploys it. CI never talks to the cluster.
-name: Build and deploy
+# Called by api.yaml and web.yaml.
+name: Build and deploy (reusable)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - ".github/workflows/build-and-deploy.yaml"
-  workflow_dispatch:
-
-# One run at a time, so two manifest commits never race each other.
-concurrency:
-  group: build-and-deploy
-  cancel-in-progress: false
-
-permissions:
-  contents: write   # commit the new image tag
-  packages: write   # push to GHCR
+  workflow_call:
+    inputs:
+      component:
+        description: Folder under src/ and manifest name under app/ (api or web)
+        required: true
+        type: string
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # One manifest update at a time, so commits to main never race each other.
+    concurrency:
+      group: update-manifests
+      cancel-in-progress: false
+    permissions:
+      contents: write   # commit the new image tag
+      packages: write   # push to GHCR
+    env:
+      COMPONENT: ${{ inputs.component }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Compute image name and tag
         id: image
         run: |
-          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/argocd-demo-app" >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/argocd-demo-${COMPONENT}" >> "$GITHUB_OUTPUT"
           echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v4
@@ -45,7 +46,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: src
+          context: src/${{ inputs.component }}
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: APP_VERSION=${{ steps.image.outputs.tag }}
@@ -56,12 +57,13 @@ jobs:
       - name: Update the image tag in the manifest
         env:
           IMAGE: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.tag }}
+          TAG: ${{ steps.image.outputs.tag }}
         run: |
-          sed -i -E "s|^(\s*image:).*|\1 ${IMAGE}|" app/deployment.yaml
+          sed -i -E "s|^(\s*image:).*|\1 ${IMAGE}|" "app/${COMPONENT}.yaml"
           git diff
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Deploy demo-app ${{ steps.image.outputs.tag }}"
-          # main may have moved while we were building.
+          git commit -am "Deploy ${COMPONENT} ${TAG}"
+          # main may have moved while we were building (e.g. the other component's deploy).
           git pull --rebase origin main
           git push origin HEAD:main
