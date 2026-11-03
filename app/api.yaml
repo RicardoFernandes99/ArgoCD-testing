@@ -24,7 +24,7 @@ spec:
       containers:
         - name: api
           # The tag is updated by CI (.github/workflows/api.yaml).
-          image: ghcr.io/ricardofernandes99/argocd-demo-api:sha-c878371
+          image: ghcr.io/ricardofernandes99/argocd-demo-api:sha-3b242b9
           ports:
             - name: http
               containerPort: 8080
