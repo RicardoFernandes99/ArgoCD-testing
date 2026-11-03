@@ -1,6 +1,6 @@
 # GitOps with Argo CD: a minimal proof of concept
 
-One app, one local Kubernetes cluster, one Git repository.
+One app (a web front end + an API), one local Kubernetes cluster, one Git repository.
 Argo CD watches this repository and keeps the cluster in sync with it.
 
 Everything runs inside a **dev container**. The only thing you need on your
@@ -10,11 +10,11 @@ machine is Docker (or nothing at all, if you use GitHub Codespaces).
 .devcontainer/devcontainer.json   Dev container: Ubuntu + Docker-in-Docker + kubectl
 scripts/install-tools.sh          Installs kind and the argocd CLI (runs automatically)
 scripts/bootstrap.sh              Creates the cluster, installs Argo CD, registers the app
-app/deployment.yaml               The demo app: nginx, 2 replicas, namespace "demo"
-app/service.yaml                  ClusterIP Service for the demo app
+app/web.yaml                      web: Deployment + Service (nginx, serves the page, proxies /api)
+app/api.yaml                      api: Deployment + Service (Node.js JSON API)
 application.yaml                  Argo CD Application: "deploy app/ from main into demo"
-src/                              Source of our own app image (Dockerfile + page)
-.github/workflows/                CI: build the image, push to GHCR, update app/deployment.yaml
+src/web/, src/api/                Source of the two images (Dockerfile + code)
+.github/workflows/                CI: build each image, push to GHCR, update its manifest in app/
 ```
 
 ---
@@ -156,8 +156,25 @@ argocd app get demo-app
 
 ## 5. Demo (this is also the script for the video)
 
+### The app
+
+The demo app has two services, like a (very) small real application:
+
+```
+ browser ──▶ web (nginx, 2 pods) ──/api/──▶ api (Node.js, 2 pods)
+             serves the page                returns { message, version, pod }
+```
+
+- **web** serves the page and forwards `/api/*` to the `api` Service inside the
+  cluster. The browser only ever talks to `web`.
+- **api** answers `GET /api/info` with its message, its version and the name
+  of the pod that answered.
+- Each one has its own source folder (`src/web`, `src/api`), image, manifest
+  (`app/web.yaml`, `app/api.yaml`) and CI workflow, so they are built and
+  deployed **independently**. Argo CD manages both from the same `app/` folder.
+
 Open a **second terminal** in the dev container for the commands below.
-These two make the demo easier to follow:
+These make the demo easier to follow:
 
 ```bash
 # Watch the pods live (third terminal, or split the terminal)
@@ -171,54 +188,62 @@ kubectl -n argocd annotate application demo-app argocd.argoproj.io/refresh=norma
 
 The **REFRESH** button in the UI does the same thing.
 
+```bash
+# Open the app on port 8081 (another terminal; leave it running)
+kubectl port-forward --address 0.0.0.0 -n demo svc/web 8081:80
+```
+
+> **Restart the port-forward after a rollout of `web`.** `kubectl port-forward`
+> attaches to a single pod, so it stops working when that pod is replaced. Stop
+> it with Ctrl+C and run the same command again.
+
 ### Step 1: initial sync
 
 As soon as `bootstrap.sh` applies `application.yaml`, Argo CD clones the repo
-and creates the Deployment and the Service.
+and creates both Deployments and both Services.
 
 ```bash
 kubectl -n argocd get application demo-app
 kubectl get deploy,svc,pods -n demo
 ```
 
-Expected: `SYNC STATUS = Synced`, `HEALTH STATUS = Healthy`, and **2 pods**
-`Running`. In the UI, the `demo-app` tile is green; click it to see the
-resource tree (Application → Service / Deployment → ReplicaSet → Pods).
+Expected: `SYNC STATUS = Synced`, `HEALTH STATUS = Healthy`, and **4 pods**
+`Running` (2 `web`, 2 `api`). In the UI, click the `demo-app` tile to see the
+resource tree (Application → Services / Deployments → ReplicaSets → Pods).
 
-To see the app itself (optional, in another terminal):
+Open <http://localhost:8081> (or port **8081** in the Codespaces Ports tab).
+The page shows the **web** and **api** versions (the commit each image was built
+from) and the API pod that answered. Click **Call the API again** a few times:
+the pod name changes as the `api` Service spreads requests across its pods.
 
-```bash
-kubectl port-forward --address 0.0.0.0 -n demo svc/demo-app 8081:80
-```
-
-Then open <http://localhost:8081> (or port **8081** in the Codespaces Ports tab):
-you get the "Welcome to nginx!" page.
-
-### Step 2: change in Git → change in the cluster (2 → 4 replicas)
+### Step 2: change in Git → change in the cluster (api: 2 → 4 replicas)
 
 ```bash
-sed -i 's/replicas: 2/replicas: 4/' app/deployment.yaml
+git pull
+sed -i 's/replicas: 2/replicas: 4/' app/api.yaml
 git diff
-git commit -am "Scale demo-app to 4 replicas"
+git commit -am "Scale api to 4 replicas"
 git push
 ```
 
 Click **REFRESH** (or use the `annotate` command above). Argo CD detects the new
-commit, briefly marks the app `OutOfSync`, syncs it, and **2 new pods** appear.
+commit, briefly marks the app `OutOfSync`, syncs it, and **2 new `api` pods**
+appear. `web` is untouched.
 
 ```bash
-kubectl get deploy demo-app -n demo   # READY 4/4
+kubectl get deploy -n demo   # api READY 4/4, web 2/2
 ```
 
 In the UI, the app's **commit/revision** is now the hash of your commit.
+**Call the API again** now shows up to 4 different pod names.
 
 ### Step 3: drift in the cluster → self-heal
 
 Someone changes the cluster by hand, going around Git:
 
 ```bash
-kubectl scale deploy/demo-app -n demo --replicas=1
-kubectl get deploy demo-app -n demo -w
+kubectl scale deploy/api -n demo --replicas=1
+kubectl get deploy api -n demo -w
 ```
 
 Within a few seconds Argo CD detects the drift (`OutOfSync`) and, because of
@@ -227,23 +252,25 @@ watching.
 
 ### Step 4: a bad change → failure → recovery via Git
 
-Push an image tag that does not exist:
+Push a `web` image tag that does not exist:
 
 ```bash
-sed -i 's|image: nginx:1.27-alpine|image: nginx:1.27-doesnotexist|' app/deployment.yaml
-git commit -am "Break the image tag"
+sed -i -E 's|(argocd-demo-web):.*|\1:sha-doesnotexist|' app/web.yaml
+git commit -am "Break the web image tag"
 git push
 kubectl -n argocd annotate application demo-app argocd.argoproj.io/refresh=normal --overwrite
 ```
 
 What happens:
 
-- The new pods get stuck in `ErrImagePull` / `ImagePullBackOff`.
-- The **old pods keep running**: the RollingUpdate does not remove healthy pods
-  while the new ones are not ready, so the app keeps responding on port 8081.
-- After about **60 s** (`progressDeadlineSeconds: 60` in the Deployment) the app
-  turns **`Degraded`** in the UI. Note that it is still `Synced`: the cluster
-  does exactly what Git says. **Git** is what is wrong.
+- The new `web` pods get stuck in `ErrImagePull` / `ImagePullBackOff`.
+- The **old `web` pods keep running**: the RollingUpdate does not remove healthy
+  pods while the new ones are not ready, so the page still works on port 8081.
+  `api` is not affected at all.
+- After about **60 s** (`progressDeadlineSeconds: 60`) the app turns
+  **`Degraded`** in the UI, and the tree shows exactly which Deployment is broken.
+  Note that it is still `Synced`: the cluster does exactly what Git says.
+  **Git** is what is wrong.
 
 ```bash
 kubectl get pods -n demo
@@ -265,15 +292,17 @@ Argo CD applies the revert, the broken pods disappear, and the app goes back to
 
 Steps 1 to 4 change the **manifests** by hand. In practice, developers change
 **code**, and a pipeline turns that into a new image and a manifest change.
-The workflow in [`.github/workflows/build-and-deploy.yaml`](.github/workflows/build-and-deploy.yaml)
-does exactly that, on every push to `main` that touches `src/`:
+Each service has a workflow ([`api.yaml`](.github/workflows/api.yaml),
+[`web.yaml`](.github/workflows/web.yaml)) that runs only when its own `src/`
+folder changes, and both use the same
+[`build-and-deploy.yaml`](.github/workflows/build-and-deploy.yaml):
 
 ```
- edit src/  ──push──▶  GitHub Actions                      Argo CD
-                       1. build image from src/            (in the cluster)
-                       2. push ghcr.io/<owner>/argocd-demo-app:sha-<commit>
-                       3. commit new tag to app/deployment.yaml ──▶ sees the commit,
-                                                                    rolls out the new image
+ edit src/api ──push──▶  GitHub Actions ("api" workflow)          Argo CD
+                         1. build image from src/api              (in the cluster)
+                         2. push ghcr.io/<owner>/argocd-demo-api:sha-<commit>
+                         3. commit new tag to app/api.yaml ──────▶ sees the commit,
+                                                                   rolls out api only
 ```
 
 The two halves have separate responsibilities:
@@ -282,49 +311,48 @@ The two halves have separate responsibilities:
   new desired state by committing to Git. It has **no access to the cluster**.
 - **CD (Argo CD)** is the only thing that changes the cluster, and only to match Git.
 
-Change the page and push:
+Change the API's message and push:
 
 ```bash
-sed -i 's/Hello from GitOps!/Hello from GitOps, v2!/' src/index.html
-git commit -am "Change the greeting"
+git pull
+sed -i 's/Hello from the API"/Hello from the API, v2"/' src/api/server.js
+git commit -am "Change the API message"
 git push
 ```
 
 Then:
 
-1. In GitHub, open the **Actions** tab and watch **Build and deploy** (about 1 to 2 minutes).
+1. In GitHub, open the **Actions** tab: only the **api** workflow runs (about 1 minute).
 2. When it finishes, there is a new commit on `main` by `github-actions[bot]`:
-   **"Deploy demo-app sha-xxxxxxx"**. Pull it locally: `git pull`.
-3. Refresh Argo CD (or wait for the poll). The Deployment rolls out the new image.
-4. Open <http://localhost:8081>. The page shows the new text and
-   `version: sha-xxxxxxx`, the commit it was built from.
+   **"Deploy api sha-xxxxxxx"**. Pull it locally: `git pull`.
+3. Refresh Argo CD (or wait for the poll). Only the `api` Deployment rolls out.
+4. Click **Call the API again** on <http://localhost:8081>. The **api** card
+   shows the new message and version, and the **web** version did not change.
+   (No port-forward restart needed: only `api` pods were replaced.)
 
 ```bash
-kubectl get deploy demo-app -n demo -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl get deploy -n demo -o custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image
 ```
 
-To roll back, `git revert` the **"Deploy demo-app ..."** commit (the
-previous image is still in GHCR), exactly as in step 4.
+To roll back, `git revert` the **"Deploy api ..."** commit (the previous image
+is still in GHCR), exactly as in step 4.
 
-> **The image must be public.** The kind cluster has no registry credentials.
-> Here the package was created public, because the Dockerfile links it to this
-> public repository (`org.opencontainers.image.source`). If your pods show
-> `ImagePullBackOff` with `403`/`unauthorized`, make it public yourself:
-> GitHub profile → **Packages** → `argocd-demo-app` → **Package settings** →
-> **Change visibility → Public**.
+> **The images must be public.** The kind cluster has no registry credentials.
+> The packages are created public here, because each Dockerfile links its image
+> to this public repository (`org.opencontainers.image.source`). If your pods
+> show `ImagePullBackOff` with `403`/`unauthorized`, make the package public
+> yourself: GitHub profile → **Packages** → `argocd-demo-api` / `argocd-demo-web`
+> → **Package settings** → **Change visibility → Public**.
 >
-> **Restart the 8081 port-forward after each rollout.** `kubectl port-forward`
-> attaches to a single pod, so it stops working when that pod is replaced. Stop
-> it with Ctrl+C and run the same command again.
->
-> **Always `git pull` before editing.** The workflow pushes commits to `main`,
+> **Always `git pull` before editing.** The workflows push commits to `main`,
 > so your local branch falls behind after each run.
 
 ### Resetting for another run
 
 ```bash
-sed -i 's/replicas: 4/replicas: 2/' app/deployment.yaml
-git commit -am "Reset demo-app to 2 replicas" && git push
+git pull
+sed -i 's/replicas: 4/replicas: 2/' app/api.yaml
+git commit -am "Reset api to 2 replicas" && git push
 ```
 
 ---
@@ -339,7 +367,9 @@ git commit -am "Reset demo-app to 2 replicas" && git push
 | `bind: address already in use` on port 8080 | A previous port-forward is still running. `pkill -f "port-forward"` and then run `./scripts/bootstrap.sh` again. |
 | The UI stopped responding | The port-forward ends if the `argocd-server` pod restarts. Run `./scripts/bootstrap.sh` again (it is idempotent). |
 | `git push` asks for credentials in the dev container | In Codespaces this works automatically. Locally, the Dev Containers extension reuses your host's Git credentials. Make sure `git push` works on the host first. |
-| After a CI deploy, pods are in **`ImagePullBackOff`** with `403`/`unauthorized` | The GHCR package is still private. Make it public (see step 5). The old pods keep serving until the new ones can pull. |
+| After a CI deploy, pods are in **`ImagePullBackOff`** with `403`/`unauthorized` | The GHCR package is private. Make it public (see step 5). The old pods keep serving until the new ones can pull. |
+| Page loads but the **api** card says `unavailable` / `HTTP 502` | `web` cannot reach `api`. Check `kubectl get pods,endpoints -n demo` (are `api` pods Ready?) and `kubectl logs deploy/api -n demo`. |
+| Page at 8081 stops loading after a deploy | The port-forward was attached to a `web` pod that was replaced. Restart the `kubectl port-forward ... svc/web 8081:80` command. |
 | Workflow fails at `git push` with **403** | Repo **Settings → Actions → General → Workflow permissions** must allow the workflow to write (the workflow asks for `contents: write`). |
 | `git push` rejected ("fetch first") after a CI run | The workflow pushed a "Deploy ..." commit. Run `git pull --rebase` and push again. |
 | Lost the admin password | `argocd admin initial-password -n argocd` |
