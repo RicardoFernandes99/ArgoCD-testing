@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitOps demo app</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+           font-family: system-ui, sans-serif; background: #1b2a3a; color: #fff; }
+    main { text-align: center; padding: 2rem; max-width: 40rem; }
+    h1 { font-size: 2.5rem; margin: 0 0 1.5rem; }
+    .cards { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+    .card { background: #243649; border-radius: 12px; padding: 1rem 1.25rem; min-width: 14rem; text-align: left; }
+    .card h2 { margin: 0 0 .5rem; font-size: 1rem; text-transform: uppercase; letter-spacing: .08em; opacity: .7; }
+    .version { display: inline-block; padding: .3rem .8rem; border-radius: 999px;
+               background: #18be94; color: #0b1a14; font-family: monospace; }
+    .error .version { background: #e96d76; }
+    #api-message { margin-top: .6rem; }
+    .meta { font-family: monospace; font-size: .85rem; opacity: .8; margin-top: .6rem; }
+    button { margin-top: 1.5rem; font: inherit; padding: .5rem 1.2rem; border-radius: 8px;
+             border: 0; background: #fff; color: #1b2a3a; cursor: pointer; }
+    p { opacity: .7; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Hello from GitOps!</h1>
+    <div class="cards">
+      <section class="card">
+        <h2>web</h2>
+        <span class="version">__APP_VERSION__</span>
+        <div class="meta">served by nginx</div>
+      </section>
+      <section class="card" id="api">
+        <h2>api</h2>
+        <span class="version" id="api-version">…</span>
+        <div id="api-message"></div>
+        <div class="meta" id="api-meta">calling /api/info</div>
+      </section>
+    </div>
+    <button id="again">Call the API again</button>
+    <p>Built by GitHub Actions, deployed by Argo CD.</p>
+  </main>
+  <script>
+    async function callApi() {
+      const card = document.getElementById("api");
+      try {
+        const res = await fetch("/api/info", { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const info = await res.json();
+        card.classList.remove("error");
+        document.getElementById("api-version").textContent = info.version;
+        document.getElementById("api-message").textContent = info.message;
+        document.getElementById("api-meta").textContent = "pod: " + info.pod;
+      } catch (err) {
+        card.classList.add("error");
+        document.getElementById("api-version").textContent = "unavailable";
+        document.getElementById("api-message").textContent = "";
+        document.getElementById("api-meta").textContent = err.message;
+      }
+    }
+    document.getElementById("again").addEventListener("click", callApi);
+    callApi();
+  </script>
+</body>
+</html>
