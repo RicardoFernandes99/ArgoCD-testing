@@ -128,6 +128,16 @@ if [[ "$current" != "true" ]]; then
   kubectl -n "$ARGOCD_NAMESPACE" rollout restart deployment/argocd-server
 fi
 
+# Custom health check for HorizontalPodAutoscalers. The built-in one reports
+# Degraded whenever the HPA has no metrics yet, which happens for ~30 s after
+# every rollout of the api (new pods have no CPU data). Treat that as
+# Progressing; only report Degraded if the HPA really cannot scale.
+kubectl -n "$ARGOCD_NAMESPACE" patch configmap argocd-cm --type merge -p "$(cat <<'EOF'
+{"data":{"resource.customizations.health.autoscaling_HorizontalPodAutoscaler":
+"hs = { status = \"Healthy\", message = \"HPA is active\" }\nif obj.status ~= nil and obj.status.conditions ~= nil then\n  for _, c in ipairs(obj.status.conditions) do\n    if c.type == \"AbleToScale\" and c.status == \"False\" then\n      return { status = \"Degraded\", message = c.message }\n    end\n    if c.type == \"ScalingActive\" and c.status == \"False\" then\n      hs = { status = \"Progressing\", message = \"Waiting for metrics: \" .. (c.message or \"\") }\n    end\n  end\nend\nreturn hs\n"}}
+EOF
+)" >/dev/null
+
 # Expose the UI on the node port that kind maps to localhost:8080.
 kubectl -n "$ARGOCD_NAMESPACE" patch service argocd-server -p \
   '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"nodePort":30080}]}}' >/dev/null

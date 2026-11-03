@@ -83,11 +83,13 @@ wait_for_ci_deploy() {
 }
 
 # Refresh Argo CD and print every status change until the app reaches
-# Synced/<health> on the current local HEAD.
+# Synced/<health> on the current local HEAD. When waiting for Degraded, the new
+# revision must have been seen Progressing first, so a stale status from
+# before the change does not count.
 watch_app() {
   local want_health="$1" timeout="${2:-240}"
   local head; head="$(git rev-parse HEAD)"
-  local start=$SECONDS last=""
+  local start=$SECONDS last="" seen_progressing=0
   info "Argo CD: waiting for Synced/$want_health on $(git rev-parse --short HEAD)"
   refresh
   while (( SECONDS - start < timeout )); do
@@ -100,8 +102,9 @@ watch_app() {
       printf '    t+%3ss  %s\n' "$((SECONDS - start))" "$now"
       last="$now"
     fi
+    [[ "$rev" == "$head" && "$health" == "Progressing" ]] && seen_progressing=1
     if [[ "$rev" == "$head" && "$sync" == "Synced" && "$health" == "$want_health" ]]; then
-      return 0
+      [[ "$want_health" != "Degraded" || $seen_progressing -eq 1 ]] && return 0
     fi
     (( (SECONDS - start) % 30 == 29 )) && refresh
     sleep 2
