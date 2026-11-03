@@ -4,6 +4,7 @@
 //   GET /healthz   -> liveness/readiness probe
 const http = require("node:http");
 const os = require("node:os");
+throw new Error("Simulated bug: api crashes on start"); // demo: break code
 
 const PORT = Number(process.env.PORT || 8080);
 const VERSION = process.env.APP_VERSION || "dev";
