@@ -9,7 +9,8 @@ machine is Docker (or nothing at all, if you use GitHub Codespaces).
 ```
 .devcontainer/devcontainer.json   Dev container: Ubuntu + Docker-in-Docker + kubectl
 scripts/install-tools.sh          Installs kind and the argocd CLI (runs automatically)
-scripts/bootstrap.sh              Creates the cluster, installs Argo CD, registers the app
+demo.sh                           One command for everything: up, status, break, fix, load, down
+scripts/bootstrap.sh              Creates/repairs the cluster, installs Argo CD, registers the app
 app/web.yaml                      web: Deployment + Service (nginx, serves the page, proxies /api)
 app/api.yaml                      api: Deployment + Service + autoscaler (Node.js JSON API)
 application.yaml                  Argo CD Application: "deploy app/ from main into demo"
@@ -39,7 +40,7 @@ the single source of truth** for the desired state of the system.
         ┌──────────────┐   git push    ┌──────────────┐
         │  Developer   │ ────────────▶ │  Git (main)  │  desired state
         └──────────────┘               └──────┬───────┘
-                                              │ 1. fetch (every ~3 min, or on Refresh)
+                                              │ 1. fetch (every ~3 min, or on refresh)
                                               ▼
                                        ┌──────────────┐
                                        │   Argo CD    │ 2. diff: desired vs. live
@@ -81,7 +82,7 @@ Resources: about **4 CPUs and 8 GB RAM** for the dev container (kind + Argo CD).
 
 > **Your own copy.** Argo CD pulls from the URL in `application.yaml`
 > (`repoURL`). To do the demo yourself, **fork** this repository and change
-> `repoURL` to your fork. You need push access for steps 2 and 4.
+> `repoURL` to your fork. You need push access for the demo steps.
 
 ---
 
@@ -112,39 +113,57 @@ kind version && kubectl version --client && argocd version --client --short
 
 ---
 
-## 4. Bootstrap: cluster + Argo CD + Application
+## 4. Start everything: `./demo.sh up`
 
-```bash
-./scripts/bootstrap.sh
+Everything in the demo goes through one script, [`demo.sh`](demo.sh):
+
+```
+./demo.sh up              Start (or repair) the cluster, Argo CD and the app
+./demo.sh status          Argo CD sync/health, deployments, pods, autoscaler
+./demo.sh break deploy    Commit + push a web image tag that does not exist
+./demo.sh break code      Commit + push an api change that crashes on start (goes through CI)
+./demo.sh fix             git revert the active break, push, wait until Healthy again
+./demo.sh load [seconds]  Load test the api (default 60 s) and watch it autoscale
+./demo.sh refresh         Make Argo CD check GitHub now
+./demo.sh down            Delete the cluster
 ```
 
-The script is **idempotent**, so you can run it again at any time. It:
-
-1. creates the kind cluster `argo-poc` (if it does not exist yet);
-2. installs Argo CD from the official `stable` manifest (`kubectl apply --server-side`);
-3. sets the Argo CD server to plain HTTP, so the UI works behind the port-forward
-   without certificate errors (fine for a local POC; **not** for production);
-4. waits for `argocd-server` to be ready;
-5. installs **metrics-server** (CPU metrics for the `api` autoscaler, step 6);
-6. applies `application.yaml`;
-7. prints the **initial `admin` password** (it is never written to the repository);
-8. exposes the UI on port **8080** (`kubectl port-forward`). This step stays in
-   the foreground, so **leave this terminal open** and open a new one for the demo.
-
-The first run takes about 3 to 5 minutes (it downloads the node image and the
-Argo CD images).
-
-### Opening the UI and logging in
-
-- **VS Code locally:** open <http://localhost:8080> (the port is forwarded automatically).
-- **Codespaces:** **Ports** tab → port **8080** ("Argo CD UI") → globe icon.
-
-Log in with **username `admin`** and the password printed by the script.
-If you lost it:
+Start with:
 
 ```bash
-argocd admin initial-password -n argocd
+./demo.sh up
 ```
+
+`up` is safe to run at any time; it only does what is missing. It runs
+[`scripts/bootstrap.sh`](scripts/bootstrap.sh), which:
+
+1. creates the kind cluster `argo-poc` with **two fixed ports**, 8080 (Argo CD UI)
+   and 8081 (the app). There are no `kubectl port-forward`s to keep alive;
+2. if the cluster already exists but is not responding (e.g. after a restart),
+   starts it again and waits for it;
+3. installs Argo CD from the official `stable` manifest (`kubectl apply --server-side`)
+   and serves its UI over plain HTTP (fine for a local POC; **not** for production);
+4. installs **metrics-server** (CPU metrics for the `api` autoscaler, step 6);
+5. applies `application.yaml`, after which **Argo CD deploys the app from Git**;
+6. prints the **initial `admin` password** (it is never written to the repository).
+
+Then `up` waits until Argo CD reports the app **Synced/Healthy** and prints the
+status. The first run takes about 3 to 5 minutes; later runs take seconds.
+
+**Stopping and starting:** just close VS Code or stop the codespace. The cluster
+lives inside the dev container and survives restarts; next time, run
+`./demo.sh up` again. You never need to redeploy the app by hand: whatever
+happens to the cluster, Argo CD puts back what is in Git.
+
+### Opening the UI and the app
+
+| | VS Code locally | Codespaces |
+|---|---|---|
+| **Argo CD UI** | <http://localhost:8080> | **Ports** tab → 8080 → globe icon |
+| **Demo app** | <http://localhost:8081> | **Ports** tab → 8081 → globe icon |
+
+Log in to Argo CD with **username `admin`** and the password printed by `up`.
+If you lost it: `argocd admin initial-password -n argocd`.
 
 Optional, to use the `argocd` CLI as well:
 
@@ -162,83 +181,65 @@ argocd app get demo-app
 The demo app has two services, like a (very) small real application:
 
 ```
- browser ──▶ web (nginx, 2 pods) ──/api/──▶ api (Node.js, 2 pods)
+ browser ──▶ web (nginx, 2 pods) ──/api/──▶ api (Node.js, 2–8 pods)
              serves the page                returns { message, version, pod }
 ```
 
 - **web** serves the page and forwards `/api/*` to the `api` Service inside the
   cluster. The browser only ever talks to `web`.
-- **api** answers `GET /api/info` with its message, its version and the name
-  of the pod that answered, and `GET /api/work` burns CPU for the load test.
-  An autoscaler adds `api` pods under load (step 6).
+- **api** answers `GET /api/info` with its message, its version and the name of
+  the pod that answered; `GET /api/work` burns CPU for the load test. An
+  autoscaler adds `api` pods under load (step 6).
 - Each one has its own source folder (`src/web`, `src/api`), image, manifest
   (`app/web.yaml`, `app/api.yaml`) and CI workflow, so they are built and
   deployed **independently**. Argo CD manages both from the same `app/` folder.
 
-Open a **second terminal** in the dev container for the commands below.
-These make the demo easier to follow:
+**Continuous deployment:** every push to `main` that changes `src/api` or
+`src/web` is built by GitHub Actions and deployed by Argo CD, with no manual
+step. On GitHub, each deploy shows up under the repo's **Deployments**
+(environment `kind-local`) and in the **Actions** tab.
+
+Suggested screen layout for the video: browser with the Argo CD UI and the app
+side by side, plus two terminals:
 
 ```bash
-# Watch the pods live (third terminal, or split the terminal)
-kubectl get pods -n demo -w
+kubectl get pods -n demo -w      # terminal 1: pods live
+./demo.sh ...                    # terminal 2: the demo commands below
 ```
+
+> Argo CD checks GitHub about every 3 minutes. The `demo.sh` commands make it
+> check right away (`./demo.sh refresh`, or the **REFRESH** button in the UI,
+> does the same).
+
+### Step 1: everything in sync
 
 ```bash
-# Ask Argo CD to check Git now instead of waiting for the next poll (~3 min)
-kubectl -n argocd annotate application demo-app argocd.argoproj.io/refresh=normal --overwrite
+./demo.sh status
 ```
 
-The **REFRESH** button in the UI does the same thing.
+Expected: `Synced/Healthy`, 2 `web` and 2 `api` pods, and the autoscaler at
+2 replicas. In the UI, click the `demo-app` tile to see the resource tree
+(Application → Services / Deployments / HPA → ReplicaSets → Pods).
 
-```bash
-# Open the app on port 8081 (another terminal; leave it running)
-kubectl port-forward --address 0.0.0.0 -n demo svc/web 8081:80
-```
+Open <http://localhost:8081>. The page shows the **web** and **api** versions
+(the commit each image was built from). Click **Call the API again** a few
+times: the pod name changes as the `api` Service spreads requests.
 
-> **Restart the port-forward after a rollout of `web`.** `kubectl port-forward`
-> attaches to a single pod, so it stops working when that pod is replaced. Stop
-> it with Ctrl+C and run the same command again.
+### Step 2: change in Git → change in the cluster
 
-### Step 1: initial sync
-
-As soon as `bootstrap.sh` applies `application.yaml`, Argo CD clones the repo
-and creates both Deployments and both Services.
-
-```bash
-kubectl -n argocd get application demo-app
-kubectl get deploy,svc,pods -n demo
-```
-
-Expected: `SYNC STATUS = Synced`, `HEALTH STATUS = Healthy`, and **4 pods**
-`Running` (2 `web`, 2 `api`). In the UI, click the `demo-app` tile to see the
-resource tree (Application → Services / Deployments → ReplicaSets → Pods).
-
-Open <http://localhost:8081> (or port **8081** in the Codespaces Ports tab).
-The page shows the **web** and **api** versions (the commit each image was built
-from) and the API pod that answered. Click **Call the API again** a few times:
-the pod name changes as the `api` Service spreads requests across its pods.
-
-### Step 2: change in Git → change in the cluster (web: 2 → 4 replicas)
+Scale `web` from 2 to 4 pods by changing Git, not the cluster:
 
 ```bash
 git pull
 sed -i 's/replicas: 2/replicas: 4/' app/web.yaml
-git diff
-git commit -am "Scale web to 4 replicas"
-git push
+git commit -am "Scale web to 4 replicas" && git push
+./demo.sh refresh
 ```
 
-Click **REFRESH** (or use the `annotate` command above). Argo CD detects the new
-commit, briefly marks the app `OutOfSync`, syncs it, and **2 new `web` pods**
-appear. `api` is untouched.
+Argo CD detects the new commit, briefly marks the app `OutOfSync`, syncs it, and
+**2 new `web` pods** appear. In the UI, the revision is now your commit.
 
-```bash
-kubectl get deploy -n demo   # web READY 4/4
-```
-
-In the UI, the app's **commit/revision** is now the hash of your commit.
-
-> Why `web` and not `api`? The `api` pod count is owned by its autoscaler
+> Why `web` and not `api`? The `api` pod count belongs to its autoscaler
 > (step 6), so `app/api.yaml` deliberately has no `replicas` field.
 
 ### Step 3: drift in the cluster → self-heal
@@ -247,151 +248,86 @@ Someone changes the cluster by hand, going around Git:
 
 ```bash
 kubectl scale deploy/web -n demo --replicas=1
-kubectl get deploy web -n demo -w
 ```
 
-Within a few seconds Argo CD detects the drift (`OutOfSync`) and, because of
-`selfHeal: true`, puts it back to **4 replicas**: Git wins. Press Ctrl+C to stop
-watching.
-
-### Step 4: a bad change → failure → recovery via Git
-
-Push a `web` image tag that does not exist:
+Within a few seconds Argo CD detects the drift and, because of `selfHeal: true`,
+puts it back to **4**: Git wins. Put it back to 2 the GitOps way:
 
 ```bash
-sed -i -E 's|(argocd-demo-web):.*|\1:sha-doesnotexist|' app/web.yaml
-git commit -am "Break the web image tag"
-git push
-kubectl -n argocd annotate application demo-app argocd.argoproj.io/refresh=normal --overwrite
+sed -i 's/replicas: 4/replicas: 2/' app/web.yaml
+git commit -am "Scale web back to 2 replicas" && git push
+./demo.sh refresh
 ```
 
-What happens:
-
-- The new `web` pods get stuck in `ErrImagePull` / `ImagePullBackOff`.
-- The **old `web` pods keep running**: the RollingUpdate does not remove healthy
-  pods while the new ones are not ready, so the page still works on port 8081.
-  `api` is not affected at all.
-- After about **60 s** (`progressDeadlineSeconds: 60`) the app turns
-  **`Degraded`** in the UI, and the tree shows exactly which Deployment is broken.
-  Note that it is still `Synced`: the cluster does exactly what Git says.
-  **Git** is what is wrong.
+### Step 4: a bad deploy → failure → fix via Git
 
 ```bash
-kubectl get pods -n demo
-kubectl -n argocd get application demo-app
+./demo.sh break deploy
 ```
+
+This commits and pushes a `web` image tag that does not exist, then follows
+Argo CD:
+
+- the new `web` pods get stuck in `ErrImagePull` / `ImagePullBackOff`;
+- the **old `web` pods keep running** (RollingUpdate does not remove healthy
+  pods while the new ones are not ready), so the page still works;
+- after about **60 s** (`progressDeadlineSeconds: 60`) the app turns
+  **`Degraded`**, and the tree shows exactly which Deployment is broken. It is
+  still `Synced`: the cluster does exactly what Git says. **Git** is what is wrong.
 
 Recovery is a Git operation, not a `kubectl` one:
 
 ```bash
-git revert --no-edit HEAD
-git push
-kubectl -n argocd annotate application demo-app argocd.argoproj.io/refresh=normal --overwrite
+./demo.sh fix
 ```
 
-Argo CD applies the revert, the broken pods disappear, and the app goes back to
-**`Healthy`**. The whole incident (break + fix) is in the `git log`.
+`fix` runs `git revert` on the break commit, pushes, and waits until the app is
+**Healthy** again. The whole incident (break + fix) is in `git log`.
 
-### Step 5: code change → CI → Argo CD (the full loop)
-
-Steps 1 to 4 change the **manifests** by hand. In practice, developers change
-**code**, and a pipeline turns that into a new image and a manifest change.
-Each service has a workflow ([`api.yaml`](.github/workflows/api.yaml),
-[`web.yaml`](.github/workflows/web.yaml)) that runs only when its own `src/`
-folder changes, and both use the same
-[`build-and-deploy.yaml`](.github/workflows/build-and-deploy.yaml):
-
-```
- edit src/api ──push──▶  GitHub Actions ("api" workflow)          Argo CD
-                         1. build image from src/api              (in the cluster)
-                         2. push ghcr.io/<owner>/argocd-demo-api:sha-<commit>
-                         3. commit new tag to app/api.yaml ──────▶ sees the commit,
-                                                                   rolls out api only
-```
-
-The two halves have separate responsibilities:
-
-- **CI (GitHub Actions)** builds and publishes artifacts, then *proposes* the
-  new desired state by committing to Git. It has **no access to the cluster**.
-- **CD (Argo CD)** is the only thing that changes the cluster, and only to match Git.
-
-Change the API's message and push:
+### Step 5: broken code → CI → failure → fix via CI
 
 ```bash
-git pull
-sed -i 's/Hello from the API"/Hello from the API, v2"/' src/api/server.js
-git commit -am "Change the API message"
-git push
+./demo.sh break code
 ```
 
-Then:
+This time the bug is in the **code**: `src/api/server.js` throws on start.
 
-1. In GitHub, open the **Actions** tab: only the **api** workflow runs (about 1 minute).
-2. When it finishes, there is a new commit on `main` by `github-actions[bot]`:
-   **"Deploy api sha-xxxxxxx"**. Pull it locally: `git pull`.
-3. Refresh Argo CD (or wait for the poll). Only the `api` Deployment rolls out.
-4. Click **Call the API again** on <http://localhost:8081>. The **api** card
-   shows the new message and version, and the **web** version did not change.
-   (No port-forward restart needed: only `api` pods were replaced.)
+1. GitHub Actions runs the **api** workflow (watch it in the **Actions** tab).
+   The build succeeds, because the code is valid; it just crashes when run.
+2. The workflow pushes **"Deploy api sha-…"**, Argo CD rolls it out, and the new
+   `api` pods go into `CrashLoopBackOff`.
+3. The old `api` pods keep serving, and the app turns **`Degraded`**.
 
 ```bash
-kubectl get deploy -n demo -o custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image
+./demo.sh fix
 ```
 
-To roll back, `git revert` the **"Deploy api ..."** commit (the previous image
-is still in GHCR), exactly as in step 4.
+`fix` reverts the bad commit. CI builds and deploys the fixed code (another
+**"Deploy api sha-…"**), and the app returns to **Healthy**. This is the full
+continuous-deployment loop in both directions: code → CI → Git → Argo CD → cluster.
 
-> **The images must be public.** The kind cluster has no registry credentials.
-> The packages are created public here, because each Dockerfile links its image
-> to this public repository (`org.opencontainers.image.source`). If your pods
-> show `ImagePullBackOff` with `403`/`unauthorized`, make the package public
-> yourself: GitHub profile → **Packages** → `argocd-demo-api` / `argocd-demo-web`
-> → **Package settings** → **Change visibility → Public**.
->
-> **Always `git pull` before editing.** The workflows push commits to `main`,
-> so your local branch falls behind after each run.
+> CI never talks to the cluster. It builds the image and **commits** the new
+> tag to `app/api.yaml`; Argo CD is the only thing that changes the cluster.
 
 ### Step 6: more load → more pods (autoscaling)
 
 GitOps decides *what* runs; Kubernetes can still decide *how many*. The `api`
-has a **HorizontalPodAutoscaler** (HPA, at the bottom of `app/api.yaml`):
-
-- it keeps between **2 and 8** `api` pods;
-- it adds pods when their average CPU goes above **50 %** of what each pod
-  requests (`cpu: 100m`), and removes them about 30 s after the load stops;
-- it reads CPU from **metrics-server**, which `bootstrap.sh` installs.
-
-The HPA itself is in Git, so Argo CD deploys and protects it like everything
-else. The Deployment has **no `replicas` field**, so Argo CD does not undo what
-the HPA decides (otherwise self-heal and the HPA would fight).
-
-Watch the autoscaler (another terminal):
+has a **HorizontalPodAutoscaler** (bottom of `app/api.yaml`) that keeps
+**2 to 8** pods, aiming for **50 %** CPU of each pod's request (`cpu: 100m`),
+and scales back down about 30 s after the load stops.
 
 ```bash
-kubectl get hpa api -n demo -w
+./demo.sh load        # 60 s of load from inside the cluster; prints CPU and pod count
 ```
 
-On <http://localhost:8081>, click **Generate load (60 s)**. The page keeps
-6 requests to `/api/work` in flight (each burns ~100 ms of CPU) and lists
-every pod that answered:
+Or click **Generate load (60 s)** on <http://localhost:8081>: the page lists
+every `api` pod that answers, so new pods appear as they join.
 
-- within ~30 s the HPA reports CPU well above `50%` and raises `REPLICAS`;
-- new `api` pods start and **appear in the page's list** as they take traffic;
-- in the Argo CD UI, the extra pods show up in the tree, and the app stays
-  **Synced**: the pod count is not part of the desired state in Git;
-- about 30 s after the load ends, the HPA scales back down to 2.
-
-```bash
-kubectl top pods -n demo     # CPU per pod, from metrics-server
-```
-
-### Resetting for another run
-
-```bash
-git pull
-sed -i 's/replicas: 4/replicas: 2/' app/web.yaml
-git commit -am "Reset web to 2 replicas" && git push
-```
+- within ~30 s the CPU goes well above `50%` and the HPA adds pods;
+- in the Argo CD UI the extra pods appear in the tree, and the app **stays
+  Synced**: the pod count is not part of the desired state in Git (the
+  Deployment has no `replicas` field, so Argo CD does not fight the HPA);
+- about 30 s after the load ends, the HPA scales back down toward 2.
 
 ---
 
@@ -399,20 +335,17 @@ git commit -am "Reset web to 2 replicas" && git push
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `kind create cluster` fails at **"Starting control-plane"** and the kubelet logs mention cgroups | The Docker host uses **cgroup v1** (common with Docker Desktop on older WSL2 setups). `bootstrap.sh` detects this and sets `failCgroupV1: false`, but nested cgroup v1 is still fragile: it often fails after a cluster has been deleted and recreated. Quick fix: **rebuild/restart the dev container** (F1 → "Dev Containers: Rebuild Container") and run `bootstrap.sh` again. Permanent fix on Windows: switch WSL2 to cgroup v2. Add `kernelCommandLine = cgroup_no_v1=all` under `[wsl2]` in `%USERPROFILE%\.wslconfig`, run `wsl --shutdown` and restart Docker Desktop. Check with `docker info \| grep -i cgroup`, which should show `Cgroup Version: 2`. |
-| App stays `Unknown` with **"remote repository is empty"** or **"repository not found"** | `repoURL` in `application.yaml` points to a repo that is empty, private or wrong. Push to `main` first; for a fork, change `repoURL` and run `kubectl apply -f application.yaml`. |
-| I pushed, but nothing changes | Argo CD polls Git every ~3 minutes. Click **REFRESH** or use the `annotate ... refresh=normal` command. Check that you pushed to `main`. |
-| `bind: address already in use` on port 8080 | A previous port-forward is still running. `pkill -f "port-forward"` and then run `./scripts/bootstrap.sh` again. |
-| The UI stopped responding | The port-forward ends if the `argocd-server` pod restarts. Run `./scripts/bootstrap.sh` again (it is idempotent). |
-| `git push` asks for credentials in the dev container | In Codespaces this works automatically. Locally, the Dev Containers extension reuses your host's Git credentials. Make sure `git push` works on the host first. |
-| After a CI deploy, pods are in **`ImagePullBackOff`** with `403`/`unauthorized` | The GHCR package is private. Make it public (see step 5). The old pods keep serving until the new ones can pull. |
-| Page loads but the **api** card says `unavailable` / `HTTP 502` | `web` cannot reach `api`. Check `kubectl get pods,endpoints -n demo` (are `api` pods Ready?) and `kubectl logs deploy/api -n demo`. |
-| Page at 8081 stops loading after a deploy | The port-forward was attached to a `web` pod that was replaced. Restart the `kubectl port-forward ... svc/web 8081:80` command. |
+| `./demo.sh up` fails at **"Starting control-plane"**, or says *"The cluster failed to start"* | The Docker host uses **cgroup v1** (common with Docker Desktop on older WSL2 setups). The cluster works and survives restarts, but creating it again after deleting it fails until the dev container is restarted: **F1 → "Dev Containers: Rebuild Container"**, then `./demo.sh up`. **Permanent fix (Windows):** switch WSL2 to cgroup v2. Add `kernelCommandLine = cgroup_no_v1=all` under `[wsl2]` in `%USERPROFILE%\.wslconfig`, run `wsl --shutdown` and restart Docker Desktop. `docker info \| grep -i cgroup` should then show `Cgroup Version: 2`. |
+| App stays `Unknown` with **"remote repository is empty"** or **"repository not found"** | `repoURL` in `application.yaml` points to a repo that is empty, private or wrong. For a fork, change `repoURL` and run `./demo.sh up`. |
+| I pushed, but nothing changes | Argo CD polls Git every ~3 minutes: `./demo.sh refresh`. For code changes, the CI run must finish first (Actions tab). |
+| `git push` fails inside the dev container | In Codespaces this works automatically. Locally, the Dev Containers extension reuses your host's Git credentials, so make sure `git push` works on the host. `demo.sh` also waits if its push fails: push from any other terminal and it continues. |
+| `fatal: detected dubious ownership in repository` | Run `git config --global --add safe.directory "$PWD"` (new dev containers do this automatically). |
+| After a CI deploy, pods are in **`ImagePullBackOff`** with `403`/`unauthorized` | The GHCR package is private. GitHub profile → **Packages** → `argocd-demo-api` / `argocd-demo-web` → **Package settings** → **Change visibility → Public**. |
+| Page loads but the **api** card says `unavailable` / `HTTP 502` | No `api` pod is Ready. `kubectl get pods -n demo` and `kubectl logs deploy/api -n demo`. |
 | Workflow fails at `git push` with **403** | Repo **Settings → Actions → General → Workflow permissions** must allow the workflow to write (the workflow asks for `contents: write`). |
-| `git push` rejected ("fetch first") after a CI run | The workflow pushed a "Deploy ..." commit. Run `git pull --rebase` and push again. |
-| `kubectl get hpa` shows **`<unknown>/50%`** | metrics-server has no data yet (it takes ~30 s after pods start), or it is not running: `kubectl -n kube-system get deploy metrics-server` and `kubectl top pods -n demo`. Rerun `bootstrap.sh` to install it. |
-| Lost the admin password | `argocd admin initial-password -n argocd` |
-| Start from scratch | `kind delete cluster --name argo-poc` and then `./scripts/bootstrap.sh` |
+| `git push` rejected ("fetch first") | A CI run pushed a "Deploy ..." commit. `git pull --rebase` and push again. |
+| `kubectl get hpa` shows **`<unknown>/50%`** | metrics-server has no data yet (~30 s after pods start), or is not running. `./demo.sh up` installs it. |
+| Port 8080/8081 does not open | `./demo.sh status`. If the cluster is down: `./demo.sh up`. In Codespaces, check the **Ports** tab. |
 | Codespace slow or pods `Pending` | Use a machine with at least 4 cores / 8 GB (`hostRequirements` in `devcontainer.json` asks for this). |
 
 Useful commands:
@@ -446,7 +379,7 @@ This POC is intentionally minimal. Natural next steps:
 ## Cleanup
 
 ```bash
-kind delete cluster --name argo-poc
+./demo.sh down
 ```
 
 Or simply delete the Codespace or dev container.
