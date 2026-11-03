@@ -13,6 +13,8 @@ scripts/bootstrap.sh              Creates the cluster, installs Argo CD, registe
 app/deployment.yaml               The demo app: nginx, 2 replicas, namespace "demo"
 app/service.yaml                  ClusterIP Service for the demo app
 application.yaml                  Argo CD Application: "deploy app/ from main into demo"
+src/                              Source of our own app image (Dockerfile + page)
+.github/workflows/                CI: build the image, push to GHCR, update app/deployment.yaml
 ```
 
 ---
@@ -259,6 +261,60 @@ kubectl -n argocd annotate application demo-app argocd.argoproj.io/refresh=norma
 Argo CD applies the revert, the broken pods disappear, and the app goes back to
 **`Healthy`**. The whole incident (break + fix) is in the `git log`.
 
+### Step 5: code change → CI → Argo CD (the full loop)
+
+Steps 1 to 4 change the **manifests** by hand. In practice, developers change
+**code**, and a pipeline turns that into a new image and a manifest change.
+The workflow in [`.github/workflows/build-and-deploy.yaml`](.github/workflows/build-and-deploy.yaml)
+does exactly that, on every push to `main` that touches `src/`:
+
+```
+ edit src/  ──push──▶  GitHub Actions                      Argo CD
+                       1. build image from src/            (in the cluster)
+                       2. push ghcr.io/<owner>/argocd-demo-app:sha-<commit>
+                       3. commit new tag to app/deployment.yaml ──▶ sees the commit,
+                                                                    rolls out the new image
+```
+
+The two halves have separate responsibilities:
+
+- **CI (GitHub Actions)** builds and publishes artifacts, then *proposes* the
+  new desired state by committing to Git. It has **no access to the cluster**.
+- **CD (Argo CD)** is the only thing that changes the cluster, and only to match Git.
+
+Change the page and push:
+
+```bash
+sed -i 's/Hello from GitOps!/Hello from GitOps, v2!/' src/index.html
+git commit -am "Change the greeting"
+git push
+```
+
+Then:
+
+1. In GitHub, open the **Actions** tab and watch **Build and deploy** (about 1 to 2 minutes).
+2. When it finishes, there is a new commit on `main` by `github-actions[bot]`:
+   **"Deploy demo-app sha-xxxxxxx"**. Pull it locally: `git pull`.
+3. Refresh Argo CD (or wait for the poll). The Deployment rolls out the new image.
+4. Open <http://localhost:8081>. The page shows the new text and
+   `version: sha-xxxxxxx`, the commit it was built from.
+
+```bash
+kubectl get deploy demo-app -n demo -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+To roll back, `git revert` the **"Deploy demo-app ..."** commit (the
+previous image is still in GHCR), exactly as in step 4.
+
+> **One-time setup: make the image public.** Images pushed to GHCR are
+> **private** by default, and the kind cluster has no credentials to pull them
+> (pods would end up in `ImagePullBackOff`). After the first workflow run:
+> GitHub profile → **Packages** → `argocd-demo-app` → **Package settings** →
+> **Change visibility → Public**.
+>
+> **Always `git pull` before editing.** The workflow pushes commits to `main`,
+> so your local branch falls behind after each run.
+
 ### Resetting for another run
 
 ```bash
@@ -278,6 +334,9 @@ git commit -am "Reset demo-app to 2 replicas" && git push
 | `bind: address already in use` on port 8080 | A previous port-forward is still running. `pkill -f "port-forward"` and then run `./scripts/bootstrap.sh` again. |
 | The UI stopped responding | The port-forward ends if the `argocd-server` pod restarts. Run `./scripts/bootstrap.sh` again (it is idempotent). |
 | `git push` asks for credentials in the dev container | In Codespaces this works automatically. Locally, the Dev Containers extension reuses your host's Git credentials. Make sure `git push` works on the host first. |
+| After a CI deploy, pods are in **`ImagePullBackOff`** with `403`/`unauthorized` | The GHCR package is still private. Make it public (see step 5). The old pods keep serving until the new ones can pull. |
+| Workflow fails at `git push` with **403** | Repo **Settings → Actions → General → Workflow permissions** must allow the workflow to write (the workflow asks for `contents: write`). |
+| `git push` rejected ("fetch first") after a CI run | The workflow pushed a "Deploy ..." commit. Run `git pull --rebase` and push again. |
 | Lost the admin password | `argocd admin initial-password -n argocd` |
 | Start from scratch | `kind delete cluster --name argo-poc` and then `./scripts/bootstrap.sh` |
 | Codespace slow or pods `Pending` | Use a machine with at least 4 cores / 8 GB (`hostRequirements` in `devcontainer.json` asks for this). |
@@ -297,10 +356,9 @@ kubectl describe pod -n demo <pod>                   # why a pod does not start
 
 This POC is intentionally minimal. Natural next steps:
 
-1. **CI with GitHub Actions.** On each push to the application code, build the
-   image, publish it (e.g. to GHCR) and **update the tag in the manifests** with
-   an automatic commit. CI never touches the cluster; Argo CD does the deploy.
-   (Alternative: [Argo CD Image Updater](https://argocd-image-updater.readthedocs.io/).)
+1. **Image Updater instead of CI commits.** Step 5 has CI commit the new tag.
+   An alternative is [Argo CD Image Updater](https://argocd-image-updater.readthedocs.io/),
+   which watches the registry and updates the tag itself.
 2. **Multiple environments with Kustomize + ApplicationSet.** A `base/` plus
    `overlays/dev` and `overlays/prod` overlays (different replicas, tags and
    resources), and an **ApplicationSet** that generates one Application per
