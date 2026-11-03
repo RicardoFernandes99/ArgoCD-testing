@@ -19,6 +19,13 @@
     .meta { font-family: monospace; font-size: .85rem; opacity: .8; margin-top: .6rem; }
     button { margin-top: 1.5rem; font: inherit; padding: .5rem 1.2rem; border-radius: 8px;
              border: 0; background: #fff; color: #1b2a3a; cursor: pointer; }
+    button + button { margin-left: .5rem; }
+    button:disabled { opacity: .5; cursor: default; }
+    .load { margin: 1.5rem auto 0; max-width: 30rem; }
+    #pods { list-style: none; padding: 0; margin: .6rem 0 0; font-family: monospace; font-size: .9rem; }
+    #pods li { padding: .15rem 0; opacity: .45; }
+    #pods li.active { opacity: 1; }
+    #pods li.active::before { content: "● "; color: #18be94; }
     p { opacity: .7; }
   </style>
 </head>
@@ -39,6 +46,12 @@
       </section>
     </div>
     <button id="again">Call the API again</button>
+    <button id="load">Generate load (60 s)</button>
+    <section class="card load" id="load-panel" hidden>
+      <h2>load test</h2>
+      <div class="meta" id="load-status"></div>
+      <ul id="pods"></ul>
+    </section>
     <p>Built by GitHub Actions, deployed by Argo CD.</p>
   </main>
   <script>
@@ -61,6 +74,63 @@
     }
     document.getElementById("again").addEventListener("click", callApi);
     callApi();
+
+    // Load test: keep several requests to /api/work in flight for 60 s.
+    // The api pods' CPU goes up, and the HPA adds pods. The list shows every
+    // pod that answered, so new pods appear as they join.
+    const LOAD_SECONDS = 60, WORKERS = 6, RECENT_MS = 5000;
+    let running = false;
+
+    async function generateLoad() {
+      if (running) return;
+      running = true;
+      const btn = document.getElementById("load");
+      const status = document.getElementById("load-status");
+      const list = document.getElementById("pods");
+      document.getElementById("load-panel").hidden = false;
+      btn.disabled = true;
+      const seen = new Map(); // pod -> { count, last }
+      let ok = 0, failed = 0;
+      const end = Date.now() + LOAD_SECONDS * 1000;
+
+      function render() {
+        const now = Date.now();
+        const left = Math.max(0, Math.ceil((end - now) / 1000));
+        status.textContent = (left ? left + " s left" : "done") +
+          " · " + ok + " requests" + (failed ? " · " + failed + " failed" : "") +
+          " · " + seen.size + " pods answered";
+        list.replaceChildren(...[...seen.entries()].map(([pod, s]) => {
+          const li = document.createElement("li");
+          li.textContent = pod + "  (" + s.count + ")";
+          if (now - s.last < RECENT_MS) li.className = "active";
+          return li;
+        }));
+      }
+
+      async function worker() {
+        while (Date.now() < end) {
+          try {
+            const res = await fetch("/api/work", { cache: "no-store" });
+            const { pod } = await res.json();
+            const s = seen.get(pod) || { count: 0, last: 0 };
+            s.count++; s.last = Date.now();
+            seen.set(pod, s);
+            ok++;
+          } catch {
+            failed++;
+            await new Promise(r => setTimeout(r, 200));
+          }
+        }
+      }
+
+      const timer = setInterval(render, 500);
+      await Promise.all(Array.from({ length: WORKERS }, worker));
+      clearInterval(timer);
+      render();
+      btn.disabled = false;
+      running = false;
+    }
+    document.getElementById("load").addEventListener("click", generateLoad);
   </script>
 </body>
 </html>
