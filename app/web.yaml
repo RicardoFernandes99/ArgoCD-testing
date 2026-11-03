@@ -49,10 +49,12 @@ metadata:
     app.kubernetes.io/component: frontend
     app.kubernetes.io/part-of: argocd-poc
 spec:
-  type: ClusterIP
+  # NodePort 30081 is mapped by kind to localhost:8081 (see scripts/bootstrap.sh).
+  type: NodePort
   selector:
     app.kubernetes.io/name: web
   ports:
     - name: http
       port: 80
       targetPort: http
+      nodePort: 30081

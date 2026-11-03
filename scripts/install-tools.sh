@@ -35,6 +35,12 @@ else
   sudo install -m 0755 "$TMP_DIR/argocd" /usr/local/bin/argocd
 fi
 
+# The workspace is often mounted with a different owner (e.g. from Windows);
+# without this, git refuses to work in it ("dubious ownership").
+if ! git config --global --get-all safe.directory | grep -qx "$PWD"; then
+  git config --global --add safe.directory "$PWD"
+fi
+
 echo
 kind version
 argocd version --client --short
