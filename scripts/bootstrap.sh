@@ -7,6 +7,7 @@ set -euo pipefail
 CLUSTER_NAME="argo-poc"
 ARGOCD_NAMESPACE="argocd"
 ARGOCD_MANIFEST="https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
+METRICS_SERVER_VERSION="v0.9.1"
 UI_PORT="8080"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -59,6 +60,16 @@ fi
 log "Waiting for argocd-server to be ready"
 kubectl -n "$ARGOCD_NAMESPACE" rollout status deployment/argocd-server --timeout=300s
 kubectl wait --for=condition=Established crd/applications.argoproj.io --timeout=60s
+
+log "Installing metrics-server $METRICS_SERVER_VERSION (needed by the api autoscaler)"
+kubectl apply -f "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml"
+# kind's kubelets use self-signed certificates.
+if ! kubectl -n kube-system get deployment metrics-server \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q -- '--kubelet-insecure-tls'; then
+  kubectl -n kube-system patch deployment metrics-server --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+fi
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
 
 log "Registering the demo Application"
 kubectl apply -f "$REPO_ROOT/application.yaml"

@@ -8,7 +8,8 @@ metadata:
     app.kubernetes.io/component: backend
     app.kubernetes.io/part-of: argocd-poc
 spec:
-  replicas: 2
+  # No "replicas" here: the HorizontalPodAutoscaler below owns the pod count.
+  # If Git also set it, Argo CD's self-heal and the HPA would fight over it.
   progressDeadlineSeconds: 60
   selector:
     matchLabels:
@@ -37,9 +38,10 @@ spec:
               port: http
           resources:
             requests:
-              cpu: 10m
+              cpu: 100m     # the HPA target (50%) is relative to this
               memory: 32Mi
             limits:
+              cpu: 200m
               memory: 128Mi
 ---
 apiVersion: v1
@@ -59,3 +61,35 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+---
+# Adds api pods when average CPU goes above 50% of the request (50m),
+# and removes them again shortly after the load stops.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: argocd-poc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      # Default is 5 minutes; shortened so the demo scales back down quickly.
+      stabilizationWindowSeconds: 30
