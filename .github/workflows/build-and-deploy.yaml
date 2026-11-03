@@ -20,6 +20,10 @@ jobs:
     concurrency:
       group: update-manifests
       cancel-in-progress: false
+    # Shows each deploy in the repo's "Deployments" view on GitHub.
+    environment:
+      name: kind-local
+      url: http://localhost:8081
     permissions:
       contents: write   # commit the new image tag
       packages: write   # push to GHCR
