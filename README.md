@@ -306,11 +306,16 @@ kubectl get deploy demo-app -n demo -o jsonpath='{.spec.template.spec.containers
 To roll back, `git revert` the **"Deploy demo-app ..."** commit (the
 previous image is still in GHCR), exactly as in step 4.
 
-> **One-time setup: make the image public.** Images pushed to GHCR are
-> **private** by default, and the kind cluster has no credentials to pull them
-> (pods would end up in `ImagePullBackOff`). After the first workflow run:
+> **The image must be public.** The kind cluster has no registry credentials.
+> Here the package was created public, because the Dockerfile links it to this
+> public repository (`org.opencontainers.image.source`). If your pods show
+> `ImagePullBackOff` with `403`/`unauthorized`, make it public yourself:
 > GitHub profile → **Packages** → `argocd-demo-app` → **Package settings** →
 > **Change visibility → Public**.
+>
+> **Restart the 8081 port-forward after each rollout.** `kubectl port-forward`
+> attaches to a single pod, so it stops working when that pod is replaced. Stop
+> it with Ctrl+C and run the same command again.
 >
 > **Always `git pull` before editing.** The workflow pushes commits to `main`,
 > so your local branch falls behind after each run.
