@@ -11,7 +11,7 @@ machine is Docker (or nothing at all, if you use GitHub Codespaces).
 scripts/install-tools.sh          Installs kind and the argocd CLI (runs automatically)
 scripts/bootstrap.sh              Creates the cluster, installs Argo CD, registers the app
 app/web.yaml                      web: Deployment + Service (nginx, serves the page, proxies /api)
-app/api.yaml                      api: Deployment + Service (Node.js JSON API)
+app/api.yaml                      api: Deployment + Service + autoscaler (Node.js JSON API)
 application.yaml                  Argo CD Application: "deploy app/ from main into demo"
 src/web/, src/api/                Source of the two images (Dockerfile + code)
 .github/workflows/                CI: build each image, push to GHCR, update its manifest in app/
@@ -125,9 +125,10 @@ The script is **idempotent**, so you can run it again at any time. It:
 3. sets the Argo CD server to plain HTTP, so the UI works behind the port-forward
    without certificate errors (fine for a local POC; **not** for production);
 4. waits for `argocd-server` to be ready;
-5. applies `application.yaml`;
-6. prints the **initial `admin` password** (it is never written to the repository);
-7. exposes the UI on port **8080** (`kubectl port-forward`). This step stays in
+5. installs **metrics-server** (CPU metrics for the `api` autoscaler, step 6);
+6. applies `application.yaml`;
+7. prints the **initial `admin` password** (it is never written to the repository);
+8. exposes the UI on port **8080** (`kubectl port-forward`). This step stays in
    the foreground, so **leave this terminal open** and open a new one for the demo.
 
 The first run takes about 3 to 5 minutes (it downloads the node image and the
@@ -168,7 +169,8 @@ The demo app has two services, like a (very) small real application:
 - **web** serves the page and forwards `/api/*` to the `api` Service inside the
   cluster. The browser only ever talks to `web`.
 - **api** answers `GET /api/info` with its message, its version and the name
-  of the pod that answered.
+  of the pod that answered, and `GET /api/work` burns CPU for the load test.
+  An autoscaler adds `api` pods under load (step 6).
 - Each one has its own source folder (`src/web`, `src/api`), image, manifest
   (`app/web.yaml`, `app/api.yaml`) and CI workflow, so they are built and
   deployed **independently**. Argo CD manages both from the same `app/` folder.
@@ -216,34 +218,36 @@ The page shows the **web** and **api** versions (the commit each image was built
 from) and the API pod that answered. Click **Call the API again** a few times:
 the pod name changes as the `api` Service spreads requests across its pods.
 
-### Step 2: change in Git → change in the cluster (api: 2 → 4 replicas)
+### Step 2: change in Git → change in the cluster (web: 2 → 4 replicas)
 
 ```bash
 git pull
-sed -i 's/replicas: 2/replicas: 4/' app/api.yaml
+sed -i 's/replicas: 2/replicas: 4/' app/web.yaml
 git diff
-git commit -am "Scale api to 4 replicas"
+git commit -am "Scale web to 4 replicas"
 git push
 ```
 
 Click **REFRESH** (or use the `annotate` command above). Argo CD detects the new
-commit, briefly marks the app `OutOfSync`, syncs it, and **2 new `api` pods**
-appear. `web` is untouched.
+commit, briefly marks the app `OutOfSync`, syncs it, and **2 new `web` pods**
+appear. `api` is untouched.
 
 ```bash
-kubectl get deploy -n demo   # api READY 4/4, web 2/2
+kubectl get deploy -n demo   # web READY 4/4
 ```
 
 In the UI, the app's **commit/revision** is now the hash of your commit.
-**Call the API again** now shows up to 4 different pod names.
+
+> Why `web` and not `api`? The `api` pod count is owned by its autoscaler
+> (step 6), so `app/api.yaml` deliberately has no `replicas` field.
 
 ### Step 3: drift in the cluster → self-heal
 
 Someone changes the cluster by hand, going around Git:
 
 ```bash
-kubectl scale deploy/api -n demo --replicas=1
-kubectl get deploy api -n demo -w
+kubectl scale deploy/web -n demo --replicas=1
+kubectl get deploy web -n demo -w
 ```
 
 Within a few seconds Argo CD detects the drift (`OutOfSync`) and, because of
@@ -347,12 +351,46 @@ is still in GHCR), exactly as in step 4.
 > **Always `git pull` before editing.** The workflows push commits to `main`,
 > so your local branch falls behind after each run.
 
+### Step 6: more load → more pods (autoscaling)
+
+GitOps decides *what* runs; Kubernetes can still decide *how many*. The `api`
+has a **HorizontalPodAutoscaler** (HPA, at the bottom of `app/api.yaml`):
+
+- it keeps between **2 and 8** `api` pods;
+- it adds pods when their average CPU goes above **50 %** of what each pod
+  requests (`cpu: 100m`), and removes them about 30 s after the load stops;
+- it reads CPU from **metrics-server**, which `bootstrap.sh` installs.
+
+The HPA itself is in Git, so Argo CD deploys and protects it like everything
+else. The Deployment has **no `replicas` field**, so Argo CD does not undo what
+the HPA decides (otherwise self-heal and the HPA would fight).
+
+Watch the autoscaler (another terminal):
+
+```bash
+kubectl get hpa api -n demo -w
+```
+
+On <http://localhost:8081>, click **Generate load (60 s)**. The page keeps
+6 requests to `/api/work` in flight (each burns ~100 ms of CPU) and lists
+every pod that answered:
+
+- within ~30 s the HPA reports CPU well above `50%` and raises `REPLICAS`;
+- new `api` pods start and **appear in the page's list** as they take traffic;
+- in the Argo CD UI, the extra pods show up in the tree, and the app stays
+  **Synced**: the pod count is not part of the desired state in Git;
+- about 30 s after the load ends, the HPA scales back down to 2.
+
+```bash
+kubectl top pods -n demo     # CPU per pod, from metrics-server
+```
+
 ### Resetting for another run
 
 ```bash
 git pull
-sed -i 's/replicas: 4/replicas: 2/' app/api.yaml
-git commit -am "Reset api to 2 replicas" && git push
+sed -i 's/replicas: 4/replicas: 2/' app/web.yaml
+git commit -am "Reset web to 2 replicas" && git push
 ```
 
 ---
@@ -372,6 +410,7 @@ git commit -am "Reset api to 2 replicas" && git push
 | Page at 8081 stops loading after a deploy | The port-forward was attached to a `web` pod that was replaced. Restart the `kubectl port-forward ... svc/web 8081:80` command. |
 | Workflow fails at `git push` with **403** | Repo **Settings → Actions → General → Workflow permissions** must allow the workflow to write (the workflow asks for `contents: write`). |
 | `git push` rejected ("fetch first") after a CI run | The workflow pushed a "Deploy ..." commit. Run `git pull --rebase` and push again. |
+| `kubectl get hpa` shows **`<unknown>/50%`** | metrics-server has no data yet (it takes ~30 s after pods start), or it is not running: `kubectl -n kube-system get deploy metrics-server` and `kubectl top pods -n demo`. Rerun `bootstrap.sh` to install it. |
 | Lost the admin password | `argocd admin initial-password -n argocd` |
 | Start from scratch | `kind delete cluster --name argo-poc` and then `./scripts/bootstrap.sh` |
 | Codespace slow or pods `Pending` | Use a machine with at least 4 cores / 8 GB (`hostRequirements` in `devcontainer.json` asks for this). |
