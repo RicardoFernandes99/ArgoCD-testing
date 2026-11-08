@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/component: frontend
     app.kubernetes.io/part-of: argocd-poc
 spec:
-  replicas: 2
+  replicas: 4
   # Short deadline so a broken rollout turns "Degraded" quickly during the demo.
   progressDeadlineSeconds: 60
   selector:
