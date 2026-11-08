@@ -22,7 +22,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/api/info") {
     return send(res, 200, {
       service: "api",
-      message: "Hello from the API",
+      message: "Hello from the API, shipped with GitOps",
       version: VERSION,
       pod: os.hostname(),
       startedAt: STARTED_AT,
