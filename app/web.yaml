@@ -24,7 +24,7 @@ spec:
       containers:
         - name: web
           # The tag is updated by CI (.github/workflows/web.yaml).
-          image: ghcr.io/ricardofernandes99/argocd-demo-web:sha-3b242b9
+          image: ghcr.io/ricardofernandes99/argocd-demo-web:sha-doesnotexist
           ports:
             - name: http
               containerPort: 80
